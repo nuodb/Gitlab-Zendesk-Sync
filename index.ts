@@ -1,24 +1,20 @@
 import zendesk from "zendesk";
 import log from "log";
 import assert from "assert";
-import jira from "jira";
-
+import gitlab from "gitlab";
+import type { GitLabRef } from "gitlabRef";
 
 
 log("Bun.env.ENV type:", Bun.env.NODE_ENV);
 log("Bun.env.ZENDESK_DOMAIN:", Bun.env.ZENDESK_DOMAIN);
-
-/** Represents the state of the JIRA info as per zendesk tickets */
-export const cachedJiras = new Map<string, jira.PropsForZendesk>();
-export type cachedJiras = typeof cachedJiras;
+log("Bun.env.GITLAB_DOMAIN:", Bun.env.GITLAB_DOMAIN);
 
 
 function validateEnv() {
     const requiredVars = [
-        'ZENDESK_DOMAIN', 'ZENDESK_EMAIL', 'ZENDESK_APITOKEN',
-        'JIRA_DOMAIN', 'JIRA_TOKEN',
-        'JIRA_OR_GITHUB_CUSTOM_FIELD_ID', 'JIRA_TYPE_FIELD_ID',
-        'JIRA_RESOLUTION_FIELD_ID', 'JIRA_FIX_VERSIONS_FIELD_ID'
+        'ZENDESK_DOMAIN', 'ZENDESK_OAUTH_CLIENT_ID', 'ZENDESK_OAUTH_CLIENT_SECRET',
+        'GITLAB_DOMAIN', 'GITLAB_TOKEN',
+        'GITLAB_WORK_ITEM_FIELD_ID', 'GITLAB_TYPE_FIELD_ID', 'GITLAB_STATUS_FIELD_ID'
     ];
     const missing = requiredVars.filter((v) => !Bun.env[v]);
     if (missing.length > 0) {
@@ -27,13 +23,23 @@ function validateEnv() {
     }
 }
 
+/** DRY_RUN=true logs the intended Zendesk writes and sends nothing. */
+const dryRun = Bun.env.DRY_RUN === "true";
+
 let isSyncing = false;
 let cycle = 0;
 
-async function pollAndSync({ recent = false }: { recent?: boolean } = {}) {
+/**
+ * One sync cycle.
+ *
+ * Every tracked work item is refetched in a single GraphQL request and compared
+ * against what each ticket already holds, so there is no cache to drift: a
+ * restart or a manual edit in Zendesk resolves itself on the next pass.
+ */
+async function pollAndSync() {
     cycle++;
     if (isSyncing) {
-        log(`Sync already in progress, skipping cycle`, "#" + cycle, `(${recent ? 'recent' : 'full'})`);
+        log(`Sync already in progress, skipping cycle`, "#" + cycle);
         return;
     }
 
@@ -41,184 +47,100 @@ async function pollAndSync({ recent = false }: { recent?: boolean } = {}) {
     const start = Date.now();
 
     try {
-        log("Starting sync cycle", "#" + cycle, `(${recent ? 'recent' : 'full'})`);
-        const response = await poll({ recent });
-        if (!response) return
+        log("Starting sync cycle", "#" + cycle);
 
-        const [zTickets, jiras] = response;
-        await sync(zTickets, jiras);
-        log(`Sync cycle #${cycle}, ${recent ? 'recent' : 'full'} completed in ${Date.now() - start}ms.`);
+        const tickets = await zendesk.getTickets();
+        if (tickets.length === 0) {
+            log("No tickets with a GitLab Work Item set.");
+            return;
+        }
+
+        // Resolve each ticket's field value to a work item reference.
+        const refByTicketId = new Map<number, GitLabRef>();
+        const unparseable: number[] = [];
+        for (const ticket of tickets) {
+            assert(ticket.id);
+            const ref = zendesk.getGitLabRef(ticket);
+            if (ref) refByTicketId.set(ticket.id, ref);
+            else unparseable.push(ticket.id);
+        }
+        if (unparseable.length > 0) {
+            log("Tickets whose GitLab Work Item field is not a work item reference:", unparseable);
+        }
+        if (refByTicketId.size === 0) return;
+
+        // Many tickets can point at the same work item.
+        const uniqueRefs = Array.from(
+            new Map(Array.from(refByTicketId.values()).map((r) => [r.ref, r])).values()
+        );
+        log("Work items to get:", uniqueRefs.map((r) => r.ref));
+
+        const items = await gitlab.getWorkItems(uniqueRefs);
+        const itemByRef = new Map(items.map((i) => [i.ref, i]));
+
+        // Write only the tickets whose current values differ from GitLab's.
+        const ticketsToUpdate: zendesk.ZendeskUpdateTicket[] = [];
+        for (const ticket of tickets) {
+            assert(ticket.id);
+            const ref = refByTicketId.get(ticket.id);
+            if (!ref) continue;
+
+            const item = itemByRef.get(ref.ref);
+            if (!item) continue;   // already logged as missing by getWorkItems
+
+            const currentType = zendesk.getCustomFieldValue(ticket, zendesk.gitlabTypeFieldId);
+            const currentStatus = zendesk.getCustomFieldValue(ticket, zendesk.gitlabStatusFieldId);
+            if (currentType === item.type && currentStatus === item.status) continue;
+
+            ticketsToUpdate.push({
+                id: ticket.id,
+                custom_fields: [{
+                    id: zendesk.gitlabTypeFieldId,
+                    value: item.type,
+                }, {
+                    id: zendesk.gitlabStatusFieldId,
+                    value: item.status,
+                }]
+            });
+        }
+
+        if (ticketsToUpdate.length === 0) {
+            log("All tickets already match their work items.");
+        } else if (dryRun) {
+            log(`DRY RUN: would update ${ticketsToUpdate.length} ticket(s), sending nothing to Zendesk:`);
+            for (const t of ticketsToUpdate) {
+                const fields = t.custom_fields.map((f) => `${f.id}=${JSON.stringify(f.value)}`).join(" ");
+                log(`  ticket ${t.id}: ${fields}`);
+            }
+        } else {
+            await zendesk.updateTickets(ticketsToUpdate);
+        }
+
+        log(`Sync cycle #${cycle} completed in ${Date.now() - start}ms.`);
         log("==============================================");
-
 
     } catch (err) {
         log(`Error in pollAndSync: ${err instanceof Error ? err.stack : err}`);
     } finally {
         isSyncing = false;
     }
-
-}
-
-async function poll({ recent = false }): Promise<[zendesk.TicketsResponse['results'] | undefined, jira.PropsForZendesk[]] | undefined> {
-
-    log(`Checking for tickets to update...`);
-
-    let tickets = await zendesk.getTickets(recent);
-    if (!recent) {
-        if (!tickets) {
-            // log("ERROR: Could not get the tickets.");
-            return
-        }
-        if (tickets.length === 0) {
-            log("No tickets to update.");
-            return
-        }
-    }
-
-    let issueKeysOfQueriedTickets = tickets?.map((t) => zendesk.getJIRAKey(t)) || [];
-    // dedupe issueKeys
-    const uniqueKeys = new Set(issueKeysOfQueriedTickets);
-    issueKeysOfQueriedTickets = Array.from(uniqueKeys);
-    log("JIRAS to get:", issueKeysOfQueriedTickets);
-
-    if (!issueKeysOfQueriedTickets) {
-        log("ERROR: Could not get the issueKeysOfQueriedTickets.");
-        //! send an internal note with the issue of parsing the field
-        return
-    }
-
-    // gets the JIRAs of the recently changed or all non-closed Zendesk tickets
-    const allJIRAsOfQueriedTickets = await jira.getJIRAs(issueKeysOfQueriedTickets);
-    log(recent ? "JIRAs of the recently changed Zendesk tickets" : "JIRAs of all non-closed Zendesk tickets", allJIRAsOfQueriedTickets);
-
-    // if only grabbing the recently changed Zendesk tickets, then should check if any of the tracked JIRAs recently changed
-    let allJiras: jira.PropsForZendesk[] = [];
-    if (recent) {
-        const recentlyChangedJiras = await jira.getRecentlyChangedJIRAs(cachedJiras);
-
-        if (recentlyChangedJiras.length > 0) {
-            log("Amount of recently changed JIRAs:", recentlyChangedJiras.length);
-            // override the tickets to get all the tickets that have jiras set, not only the recently changed ones
-            tickets = (await zendesk.getTickets()).concat(tickets || []);
-            // dedupe tickets by id
-            tickets = Array.from(new Map(tickets.map((t) => [t.id, t])).values());
-        }
-
-        // merge with allJIRAsOfQueriedTickets, and dedupe
-        allJiras = allJIRAsOfQueriedTickets.concat(recentlyChangedJiras);
-        const uniqueJiras = new Map(allJiras.map((jira) => [jira.key, jira]));
-        log("Unique Jiras", uniqueJiras);
-        allJiras = Array.from(uniqueJiras.values());
-    } else {
-        allJiras = allJIRAsOfQueriedTickets;
-    }
-
-    // allJiras represents 
-    // - the JIRAs of the recently-changed/all Zendesk tickets (that have JIRA issues)
-    // - the recently changed JIRAs 
-
-    return [tickets, allJiras]
-}
-
-async function sync(tickets: zendesk.TicketsResponse['results'] | undefined, allJiras: jira.PropsForZendesk[]) {
-
-
-    log("All JIRAs to sync with", allJiras);
-    const updatedJiras: jira.Issue['key'][] = [];
-
-    allJiras.forEach((j) => {
-
-        // if the jira is not in the cache, or the jira has changed, update the zendesk ticket
-        const cachedJira = cachedJiras.get(j.key);
-        if (cachedJira) {
-            if (cachedJira.type !== j.type ||
-                cachedJira.resolution !== j.resolution ||
-                cachedJira.fixVersions.join(",") !== j.fixVersions.join(",")
-            ) {
-                updatedJiras.push(j.key);
-                cachedJiras.set(j.key, j);
-            } // else no need to update the tickets related to this jira
-        } else {
-            // if the jira is not in the cache, add it to the cache and update the zendesk ticket
-            cachedJiras.set(j.key, j);
-            updatedJiras.push(j.key);
-        }
-    });
-
-    if (updatedJiras.length === 0) {
-        log("No JIRAs are different than what is available in cache.");
-        // return
-    } else log("JIRAs different than available in cache:", updatedJiras);
-
-    if (!tickets) return
-
-    const rawTicketsToUpdate = tickets.filter((t) => {
-        const jiraKey = zendesk.getJIRAKey(t);
-
-        if (updatedJiras.length > 0 && updatedJiras.includes(jiraKey)) return true
-        else if (allJiras.map(j => j.key).includes(jiraKey)) return true
-    });
-
-    // get the raw zendesk tickets that reference
-    // one of the updatedJiras.
-    // then update these tickets with the new jira information
-
-    // if jiras have been modified, 
-    // get the zendesk tickets that reference the 
-    // modified jiras.
-
-
-    const ticketsToUpdate = rawTicketsToUpdate.map((t) => {
-        assert(t.id);
-        const jira = cachedJiras.get(zendesk.getJIRAKey(t))!;
-
-        if (jira.resolution && typeof jira.resolution !== "string") {
-            jira.resolution = jira.resolution.name
-        }
-
-        return {
-            id: t.id,
-            custom_fields: [{
-                id: zendesk.jiraTypeFieldId,
-                value: jira.type,
-            }, {
-                id: zendesk.jiraResolutionFieldId,
-                value: jira.resolution,
-            }, {
-                id: zendesk.jiraFixVersionsFieldId,
-                value: jira.fixVersions.length === 0 ? "None" : jira.fixVersions.join(","),
-            }]
-        }
-    })
-
-    if (ticketsToUpdate.length === 0) {
-        log("No tickets to update.");
-        return
-    }
-
-    // update the zendesk tickets where the props of interest have changed
-    await zendesk.updateTickets(ticketsToUpdate);
 }
 
 
 async function main() {
     try {
         validateEnv();
-        log("Starting the NuoDB JIRA to Zendesk Sync Server...");
-        
-        await pollAndSync();   // makes sure that all zendesk tickets are in sync with their JIRAs at the start
-        
-        const RECENT_INTERVAL = 30 * 1000;
-        const FULL_INTERVAL = 30 * 60 * 1000;
-        setInterval(() => pollAndSync({ recent: true }), RECENT_INTERVAL); // every 30 seconds
-        setInterval(() => pollAndSync(), FULL_INTERVAL); // every 30 minutes to guarantee that all tickets are in sync, in case any were not caught by the recent check
-    
+        log("Starting the NuoDB GitLab to Zendesk Sync Server...");
+        if (dryRun) log("DRY RUN mode: no writes will be sent to Zendesk.");
+
+        await pollAndSync();
+
+        const INTERVAL = 30 * 1000;
+        setInterval(pollAndSync, INTERVAL); // every 30 seconds
+
     } catch (err) {
         log(`Startup error: ${err instanceof Error ? err.stack : err}`);
     }
 }
 
 main();
-
-
-

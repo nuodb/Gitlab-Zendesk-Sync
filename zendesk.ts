@@ -2,26 +2,97 @@ import log from "log";
 import type { components, paths } from "zendesk-openapi";
 import createClient from "openapi-fetch";
 import assert from "assert";
+import { parseRef, type GitLabRef } from "gitlabRef";
 
 // aliasing global fetch to avoid collision with zendesk.fetch
 const ftch = fetch;
 
 namespace zendesk {
 
-    export const jiraOrGithubCustomFieldId = Number(Bun.env.JIRA_OR_GITHUB_CUSTOM_FIELD_ID);
-    export const jiraTypeFieldId = Number(Bun.env.JIRA_TYPE_FIELD_ID);  // "JIRA Type" field
-    export const jiraResolutionFieldId = Number(Bun.env.JIRA_RESOLUTION_FIELD_ID);  // "JIRA Resolution" field
-    export const jiraFixVersionsFieldId = Number(Bun.env.JIRA_FIX_VERSIONS_FIELD_ID);  // "JIRA Fix Versions" field
+    export const gitlabWorkItemFieldId = Number(Bun.env.GITLAB_WORK_ITEM_FIELD_ID);  // "GitLab Work Item" field
+    export const gitlabTypeFieldId = Number(Bun.env.GITLAB_TYPE_FIELD_ID);  // "GitLab Type" field
+    export const gitlabStatusFieldId = Number(Bun.env.GITLAB_STATUS_FIELD_ID);  // "GitLab Status" field
 
-    //@ts-ignore
-    export const auth = btoa(`${Bun.env.ZENDESK_EMAIL}/token:${Bun.env.ZENDESK_APITOKEN}`);
+    /** Host of the GitLab instance, used to reject links to anywhere else. */
+    const gitlabHost = (() => {
+        try {
+            return new URL(`${Bun.env.GITLAB_DOMAIN}`).host;
+        } catch {
+            return undefined;
+        }
+    })();
+
+    /**
+     * OAuth client_credentials auth.
+     *
+     * Access tokens expire after 30 minutes, so they are minted on demand and
+     * cached; only the client id and secret are configured.
+     *
+     * The token acts as the OAuth client's owner, and that identity is load
+     * bearing: the Zendesk trigger that posts the internal note fires on
+     * "Current user is <that user> and Update via is Web service (API)".
+     * Changing the client's owner changes which updates produce a note.
+     */
+    const OAUTH_SCOPES = "tickets:read tickets:write read write";
+
+    /** Mint a new token this many ms before the current one actually expires. */
+    const EXPIRY_MARGIN_MS = 60_000;
+
+    let cachedToken: { value: string, expiresAt: number } | undefined;
+
+    export async function getAccessToken(forceRefresh = false): Promise<string> {
+        if (!forceRefresh && cachedToken && Date.now() < cachedToken.expiresAt) {
+            return cachedToken.value;
+        }
+
+        const response = await ftch(`${Bun.env.ZENDESK_DOMAIN}/oauth/tokens`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+                grant_type: "client_credentials",
+                client_id: `${Bun.env.ZENDESK_OAUTH_CLIENT_ID}`,
+                client_secret: `${Bun.env.ZENDESK_OAUTH_CLIENT_SECRET}`,
+                scope: OAUTH_SCOPES,
+            }),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Zendesk token request failed: ${response.status} ${await response.text()}`);
+        }
+
+        const data = await response.json() as { access_token: string, expires_in: number };
+        cachedToken = {
+            value: data.access_token,
+            expiresAt: Date.now() + (data.expires_in * 1000) - EXPIRY_MARGIN_MS,
+        };
+        log(`Minted Zendesk access token, valid for ${data.expires_in}s`);
+        return cachedToken.value;
+    }
+
+    /** Drop the cached token so the next request mints a fresh one. */
+    function invalidateToken() {
+        cachedToken = undefined;
+    }
 
     export const client = createClient<paths>({
         baseUrl: `${Bun.env.ZENDESK_DOMAIN}`,
         headers: {
             'Content-Type': "application/json",
-            "Authorization": `Basic ${auth}`
+            // Without this the search endpoint answers 415 rather than JSON.
+            "Accept": "application/json",
         }
+    });
+
+    client.use({
+        async onRequest({ request }) {
+            request.headers.set("Authorization", `Bearer ${await getAccessToken()}`);
+            return request;
+        },
+        async onResponse({ response }) {
+            // A token revoked early still 401s despite the expiry margin.
+            if (response.status === 401) invalidateToken();
+            return response;
+        },
     });
 
 
@@ -48,14 +119,23 @@ namespace zendesk {
         )[];
     }
 
-    export function fetch(input: string | Request, init?: Omit<BunFetchRequestInit, 'headers'>): Promise<ZendeskResponse> {
-        return ftch(`${Bun.env.ZENDESK_DOMAIN}${input}`, {
+    export async function fetch(input: string | Request, init?: Omit<BunFetchRequestInit, 'headers'>): Promise<ZendeskResponse> {
+        const send = async (token: string) => await ftch(`${Bun.env.ZENDESK_DOMAIN}${input}`, {
             headers: {
                 'Content-Type': "application/json",
-                "Authorization": `Basic ${auth}`
+                "Accept": "application/json",
+                "Authorization": `Bearer ${token}`
             },
             ...init
-        }) as unknown as Promise<ZendeskResponse>;
+        }) as unknown as ZendeskResponse;
+
+        let response = await send(await getAccessToken());
+        if (response.status === 401) {
+            // Token revoked or expired early; mint a fresh one and try once more.
+            invalidateToken();
+            response = await send(await getAccessToken(true));
+        }
+        return response;
     }
 
     export async function getTicket(ticketId: number) {
@@ -74,7 +154,7 @@ namespace zendesk {
 
     const defaultTicket = {
         ticket: {
-            subject: "Ticket for testing jira to zendesk sync server",
+            subject: "Ticket for testing gitlab to zendesk sync server",
             comment: {
                 body: "pass a ticket to createTicket function if desired to set a first specific comment"
             },
@@ -103,14 +183,12 @@ namespace zendesk {
 
 
     /**
-     * Get the Zendesk tickets that are not solved or closed that have the "JIRA or Github" field set.
-     * @returns 
+     * Get the Zendesk tickets that are not closed and have the "GitLab Work Item" field set.
+     * @returns
      */
-    export async function getTickets(recent = false): Promise<any[]> {
+    export async function getTickets(): Promise<any[]> {
 
-        // if recent, only get tickets that have been updated in the last 60 seconds
-        const recencyClause = recent ? `updated>${new Date(new Date().getTime() - 60 * 1000).toISOString()}` : "";
-        const query = `type:ticket status<closed ${recencyClause} custom_field_${jiraOrGithubCustomFieldId}:*`
+        const query = `type:ticket status<closed custom_field_${gitlabWorkItemFieldId}:*`
 
         const { data, error } = await client.GET(`/api/v2/search`, {
             params: { query: { query } }
@@ -127,25 +205,31 @@ namespace zendesk {
             return []
         }
 
-        log(`Tickets that are not closed that have a JIRA field set${recent ? " and the zendesk ticket was recently updated" : ""}:`, data.results.map((t) => t.id));
+        log("Tickets that are not closed that have a GitLab Work Item set:", data.results.map((t) => t.id));
 
         return data.results || data as TicketsResponse['results']
     }
 
 
-    /**
-     * 
-     * @param ticket 
-     * @returns e.g. 'DB-40467'
-     */
-    export function getJIRAKey(ticket: NonNullable<zendesk.TicketsResponse['results']>[number]): string {
-        const jira = ticket.custom_fields.find((field) => field.id === zendesk.jiraOrGithubCustomFieldId);
+    /** Current value of one of the ticket's custom fields, as a string. */
+    export function getCustomFieldValue(
+        ticket: NonNullable<zendesk.TicketsResponse['results']>[number],
+        fieldId: number,
+    ): string {
+        const field = ticket.custom_fields.find((f) => f.id === fieldId);
+        return field?.value == null ? "" : String(field.value);
+    }
 
-        let jiraKey: string = jira?.value;
-        if (jiraKey.includes("nuojira")) {
-            jiraKey = jiraKey.slice(jiraKey.lastIndexOf("/") + 1);
-        }
-        return jiraKey
+    /**
+     * The GitLab work item a ticket points at.
+     * @param ticket
+     * @returns e.g. { ref: 'nuodb/server/nuodb#14509', ... }, or null when the
+     *          field holds something that is not a GitLab work item reference.
+     */
+    export function getGitLabRef(
+        ticket: NonNullable<zendesk.TicketsResponse['results']>[number],
+    ): GitLabRef | null {
+        return parseRef(getCustomFieldValue(ticket, zendesk.gitlabWorkItemFieldId), gitlabHost);
     }
 
 
@@ -162,28 +246,38 @@ namespace zendesk {
 
     }
 
+    /**
+     * Only fields are written. The internal note is added by a Zendesk trigger
+     * that fires on updates made by this service account, which is the only way
+     * to have the note authored by System rather than by a person.
+     */
     export interface ZendeskUpdateTicket {
         id: number,
         custom_fields: NonNullable<TicketsResponse['results']>[number]['custom_fields']
     }
 
 
+    /** Zendesk rejects update_many requests carrying more than 100 tickets. */
+    const UPDATE_MANY_LIMIT = 100;
+
     export async function updateTickets(ticketsToUpdate: ZendeskUpdateTicket[]) {
 
-        const body = {
-            tickets: ticketsToUpdate
-        };
+        for (let i = 0; i < ticketsToUpdate.length; i += UPDATE_MANY_LIMIT) {
+            const body = {
+                tickets: ticketsToUpdate.slice(i, i + UPDATE_MANY_LIMIT)
+            };
 
-        log("Updating JIRA props for zendesk tickets", body);
-        const response = (await fetch(`/api/v2/tickets/update_many`, {
-            method: "PUT",
-            body: JSON.stringify(body)
-        }));
+            log("Updating GitLab props for zendesk tickets", body);
+            const response = (await fetch(`/api/v2/tickets/update_many`, {
+                method: "PUT",
+                body: JSON.stringify(body)
+            }));
 
-        if (!response.ok) {
-            log("Error updating tickets with status:", response.statusText);
-        } else {
-            log("Updated tickets:", body.tickets.map((t) => t.id));
+            if (!response.ok) {
+                log("Error updating tickets with status:", response.statusText);
+            } else {
+                log("Updated tickets:", body.tickets.map((t) => t.id));
+            }
         }
     }
 }

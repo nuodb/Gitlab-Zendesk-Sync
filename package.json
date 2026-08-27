@@ -1,5 +1,5 @@
 {
-  "name": "jira-to-zd-sync",
+  "name": "gitlab-to-zd-sync",
   "module": "index.ts",
   "type": "module",
   "private": true,

@@ -16,13 +16,9 @@ logs
 _.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
-# dotenv environment variable files
-!.env.example
+# dotenv environment variable files - hold live credentials, never commit
 .env*
-.env.development
-.env.test
-.env.production
-.env.local
+
 
 # caches
 .eslintcache
@@ -36,3 +32,4 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 commit.txt
+

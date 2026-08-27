@@ -1,9 +1,10 @@
-# Zendesk ↔ JIRA Sync Server
+# Zendesk GitLab Sync Server
 
 <!-- TOC -->
 - [Quick Commands for Production Maintenance](#quick-commands-for-production-maintenance)
 - [Features](#features)
 - [How It Works](#how-it-works)
+- [Field Mapping](#field-mapping)
 - [Configuration](#configuration)
 - [File Structure](#file-structure)
 - [Running the Server (Production & Development)](#running-the-server-production--development)
@@ -11,20 +12,21 @@
   - [Development](#development)
   - [Testing](#testing)
   - [Health Check](#health-check)
+  - [Dry Run](#dry-run)
 - [Running with Docker Compose](#running-with-docker-compose)
-- [Deployment Instructions (Docker Compose)](#deployment-instructions-docker-compose)
-- [Docker Compose and Networking Notes](#docker-compose-and-networking-notes)
-- [Troubleshooting](#troubleshooting)
+
 <!-- /TOC -->
 
-This project is a Node.js/Bun-based server that keeps Zendesk ticket custom fields in sync with their corresponding JIRA issues. It is designed to ensure that Zendesk tickets always reflect the latest state of their linked JIRA issues, such as type, resolution, and fix versions.
+This project is a Bun-based server that keeps Zendesk ticket custom fields in sync with their corresponding GitLab work items. It ensures that Zendesk tickets always reflect the current type and status of the work item they are linked to, so agents do not have to leave Zendesk to check.
+
+Data flows one way, from GitLab to Zendesk. Nothing is ever written back to GitLab.
 
 ## Quick Commands for Production Maintenance
 
 To start the production server:
 
 ```bash
-docker compose up --build -d jira-zendesk-prod
+docker compose up --build -d gitlab-zendesk-prod
 ```
 
 To stop the production server:
@@ -36,68 +38,90 @@ docker compose down
 ## Features
 
 - **Automatic Polling:**
-  - Polls Zendesk for tickets with JIRA links and fetches the latest JIRA issue data.
-  - Runs two intervals:
-    - Every 30 seconds: Syncs recently changed tickets and JIRAs.
-    - Every 30 minutes: Performs a full sync to catch any missed updates.
-- **Efficient Updates:**
-  - Uses a cache to avoid unnecessary updates.
-  - Only updates Zendesk tickets if the JIRA issue's type, resolution, or fix versions have changed.
-- **Custom Field Mapping:**
-  - Maps JIRA fields to Zendesk custom fields (IDs are configurable via environment variables).
+  - Polls Zendesk every 30 seconds for open tickets that have a GitLab work item linked.
+  - Fetches every linked work item from GitLab in a single GraphQL request, regardless of how many tickets or projects are involved.
+- **Stateless Comparison:**
+  - Holds no cache. Each cycle compares GitLab's values against the values already on the ticket and writes only the tickets that differ.
+  - A restart, a missed cycle, or a manual edit in Zendesk corrects itself on the next pass.
+- **Internal Notes:**
+  - The sync writes only fields. The internal note is added by a Zendesk trigger that fires on updates made by the sync's service account, so the note is authored by System rather than by a person.
+- **Dry Run Mode:**
+  - `DRY_RUN=true` logs every intended write without sending anything to Zendesk.
 - **Error Logging:**
-  - Logs errors and sync activity for monitoring and debugging.
+  - Logs sync activity, unparseable field values, and work items that GitLab did not return.
 
 ## How It Works
 
 1. **Startup:**
-   - Logs environment info.
-   - Performs an initial full sync.
-   - Starts two polling intervals (recent and full sync).
+   - Validates that all required environment variables are set, and exits if any are missing.
+   - Runs one sync cycle immediately, then every 30 seconds.
+   - A guard prevents cycles from overlapping if one runs long.
 
 2. **Polling:**
-   - Fetches Zendesk tickets that are not closed and have a JIRA key set.
-   - Extracts JIRA keys and fetches the corresponding JIRA issues.
-   - If running a recent sync, also fetches recently changed JIRAs and merges them.
+   - Searches Zendesk for tickets that are not closed and have the "GitLab Work Item" field set.
+   - Parses each field value into a work item reference. Full URLs, `/-/issues/` links, and hand-typed `group/project#123` references are all accepted; anything else is logged and skipped.
+   - Fetches all referenced work items from GitLab in one GraphQL request, grouped by namespace.
 
 3. **Syncing:**
-   - Compares each JIRA issue with the cached version.
-   - If a JIRA issue is new or has changed, updates the cache and marks it for update.
-   - Finds Zendesk tickets referencing updated JIRAs and updates their custom fields.
+   - Compares each ticket's current "GitLab Type" and "GitLab Status" values against the work item.
+   - Builds an update only for tickets where at least one value differs.
+   - Sends the updates in bulk, in batches of 100, together with the internal note.
+
+## Field Mapping
+
+| Zendesk field | GitLab source | Example values |
+| --- | --- | --- |
+| GitLab Work Item | The link an agent pastes in. Read only, never written. | `https://nuohub/nuodb/server/nuodb/-/work_items/14509` |
+| GitLab Type | Work item type | Customer Support Request, Bug, Improvement, Spike |
+| GitLab Status | Status widget | Open, Untriaged, In progress, Code review, Done, Duplicate, Won't do, Not a bug, Cannot reproduce |
+
+All three must be text fields in Zendesk. A drop-down would reject any value not already defined as an option.
+
+Merge request and epic links are recognised but skipped, and are logged when encountered.
 
 ## Configuration
 
-Set the following environment variables in `.env.production` and `.env.development` based on the usage. **Do not commit files with secrets.** For sharing variable names, use a `.env.example` file:
+Set the following environment variables in `.env`. 
 
-- `ZENDESK_DOMAIN` - Zendesk API base URL
-- `ZENDESK_EMAIL` - Zendesk user email
-- `ZENDESK_APITOKEN` - Zendesk API token
-- `JIRA_DOMAIN` - JIRA API base URL
-- `JIRA_TOKEN` - JIRA API token
-- `JIRA_OR_GITHUB_CUSTOM_FIELD_ID` - Zendesk custom field ID for JIRA key
-- `JIRA_TYPE_FIELD_ID` - Zendesk custom field ID for JIRA type
-- `JIRA_RESOLUTION_FIELD_ID` - Zendesk custom field ID for JIRA resolution
-- `JIRA_FIX_VERSIONS_FIELD_ID` - Zendesk custom field ID for JIRA fix versions
+- `ZENDESK_DOMAIN` - Zendesk API base URL, no trailing slash
+- `ZENDESK_OAUTH_CLIENT_ID` - Zendesk OAuth client identifier
+- `ZENDESK_OAUTH_CLIENT_SECRET` - Zendesk OAuth client secret
+- `GITLAB_DOMAIN` - GitLab base URL, no trailing slash. Also used to reject work item links pointing at any other host
+- `GITLAB_TOKEN` - GitLab personal access token with the `read_api` scope
+- `GITLAB_WORK_ITEM_FIELD_ID` - Zendesk custom field ID for the work item link
+- `GITLAB_TYPE_FIELD_ID` - Zendesk custom field ID for the work item type
+- `GITLAB_STATUS_FIELD_ID` - Zendesk custom field ID for the work item status
 
-Refer to http://nuoconfluence/display/SERVICES/JIRA+-+Zendesk+Sync+Server for default/example values.
+Optional:
+
+- `DRY_RUN` - set to `true` to log intended writes without sending them
+- `NODE_ENV` - controls the log file prefix
+
+Zendesk access tokens from the `client_credentials` grant expire after 30 minutes, so the server mints its own and caches them in memory, refreshing a minute before expiry and again on any 401. Only the client id and secret are configured; no access token is stored.
+
+Tokens act as the OAuth client's **owner**, and that identity is what the internal note trigger keys on. The trigger fires on `Current user is <owner> AND Update via is Web service (API)`. The "Update via" part matters: without it the trigger would also fire on every ticket that user edits by hand in the browser.
+
+The token is requested with the scopes `tickets:read tickets:write read write`. The broader `read` scope is required, not just `tickets:read`: the sync locates its tickets through the search endpoint, which answers 403 to a `tickets:read` only token.
 
 ## File Structure
 
-- `index.ts` - Main server logic and polling/sync orchestration
+- `index.ts` - Main server logic and the sync cycle
 - `zendesk.ts` - Zendesk API client and helpers
-- `jira.ts` - JIRA API client and helpers
+- `gitlab.ts` - GitLab GraphQL client
+- `gitlabRef.ts` - Parsing of work item links into references
 - `log.ts` - Logging utilities
 - `logs/` - Server log files
 - `health-check.ts` - Health check script
-- `tests/` - Test suite (with mocks and helpers)
+- `tests/unit/` - Offline test suite, no credentials required
 - `docker-compose.yml` - Docker Compose configuration
 - `Dockerfile` - Docker build instructions
-- `.env.*` - Environment variable files
+- `.dockerignore` - Keeps secrets and `node_modules` out of the image
+- `.env` - Environment variable file
 
 ## Running the Server (Production & Development)
 
-- The `jira-zendesk-dev`, `jira-zendesk-prod`, and `jira-zendesk-test` services are defined in your `docker-compose.yml`.
-- Use the appropriate `.env` file for each environment (e.g., `.env.development` for dev, `.env.production` for prod, `.env.test` for test).
+- The `gitlab-zendesk-dev`, `gitlab-zendesk-prod`, `gitlab-zendesk-test`, and `gitlab-zendesk-health` services are defined in `docker-compose.yml`.
+- All of them read the same `.env` file.
 
 ### Production
 
@@ -112,14 +136,14 @@ Or, with Docker Compose:
 ```bash
 # Start the production service in the background
 # (add --build to force a rebuild)
-docker compose up --build -d jira-zendesk-prod
+docker compose up --build -d gitlab-zendesk-prod
 # View logs
-docker compose logs -f jira-zendesk-prod
+docker compose logs -f gitlab-zendesk-prod
 ```
 
 ### Development
 
-To run the development server (with hot reload, debug, or dev-specific settings):
+To run the development server with hot reload:
 
 ```bash
 bun dev
@@ -128,87 +152,54 @@ bun dev
 Or, with Docker Compose:
 
 ```bash
-# Start the development service in the background
-docker compose up --build -d jira-zendesk-dev
-# View logs
-docker compose logs -f jira-zendesk-dev
+docker compose up --build -d gitlab-zendesk-dev
+docker compose logs -f gitlab-zendesk-dev
 ```
+
+The dev service mounts the source files, so edits on the host apply without a rebuild.
 
 ### Testing
 
-To run tests, you should first start the development server (so that any required services or dependencies are available):
-
-**Without Docker Compose:**
+The tests are offline. They need no credentials, no network, and no running server:
 
 ```bash
-bun dev
-# In another terminal:
-bun test
+bun test tests/unit
 ```
 
-**With Docker Compose:**
+With Docker Compose:
 
 ```bash
-# Start the development server (if not already running)
-docker compose up --build -d jira-zendesk-dev
-# Then run tests
-docker compose run --rm jira-zendesk-test
+docker compose run --rm gitlab-zendesk-test
 ```
-
 
 ### Health Check
 
-You can verify that your environment variables and API credentials are correct and that both JIRA and Zendesk APIs are reachable.
+Verifies that the environment variables and API credentials are correct and that both APIs are reachable. It performs three checks: a Zendesk ticket read, the Zendesk search query the sync depends on, and a GitLab API call.
 
-
-#### Run locally
-
-```bash
-NODE_ENV=development bun health-check
-NODE_ENV=production bun health-check
-```
-
-#### Run with Docker Compose
+Run locally:
 
 ```bash
-docker compose run -e NODE_ENV=development --rm jira-zendesk-health
-docker compose run -e NODE_ENV=production --rm jira-zendesk-health
+bun run health-check.ts
 ```
 
-This will attempt to connect to both APIs using the current environment and print the result to the console. Set `NODE_ENV` as needed for your environment.
+Run with Docker Compose:
+
+```bash
+docker compose run --rm gitlab-zendesk-health
+```
+
+The search check also reports how many open tickets currently have a work item linked.
+
+### Dry Run
+
+Before the first run against a live Zendesk, set `DRY_RUN=true` in `.env` and start the server normally. It performs a full cycle and logs every ticket it would update, the field values, and the text of any internal note, without sending anything.
+
+This is the fastest way to see how many tickets are affected and whether any field values are stale or unparseable.
 
 ## Running with Docker Compose
 
 - Ensure you have Docker and Docker Compose installed.
-- Copy `.env.example` to `.env.production` and/or `.env.development` and fill in the required values.
+- Copy `.env.example` to `.env` and fill in the required values.
 - Use `docker compose up --build -d <service>` to start a service in detached mode.
 - Use `docker compose logs -f <service>` to follow the logs of a service.
-
-## Deployment Instructions (Docker Compose)
-
-1. **Prepare Environment Variables:**
-   - Copy the example environment file: `cp .env.example .env.production`
-   - Edit `.env.production` to set your production values.
-
-2. **Build and Start Services:**
-   - Run `docker compose up --build -d jira-zendesk-prod` to build and start the production services.
-
-3. **Monitor Logs:**
-   - Use `docker compose logs -f jira-zendesk-prod` to monitor the logs for any issues.
-
-4. **Verify Deployment:**
-   - Check the health of the services and verify that the application is working as expected.
-
-## Docker Compose and Networking Notes
-
-- Docker Compose creates a default network for your application. All services are connected to this network and can communicate with each other using the service name as the hostname.
-- If you need to connect to external services (like databases or APIs), ensure that the necessary ports are exposed and any required environment variables are set.
-- For development, you might want to use `docker compose up --build` to rebuild the images when code changes. For production, use `docker compose up -d` to start the services in detached mode.
-
-## Troubleshooting
-
-- **Log files not created:** Ensure the `logs/` directory exists and is writable by the container. If using Docker Compose, check volume permissions.
-- **Environment variables not loaded:** Make sure you have the correct `.env.*` file for your environment and it is in the project root.
-- **Docker image not rebuilding:** Use `docker compose up --build -d ...` to force a rebuild.
-- **Permission errors:** If you see file or directory permission errors, check your Docker volume mappings and user permissions.
 

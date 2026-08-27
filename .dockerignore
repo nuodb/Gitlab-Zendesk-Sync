@@ -1,0 +1,13 @@
+# Installed inside the image by `bun install`.
+node_modules
+
+# Mounted as a volume at run time.
+logs
+*.log
+
+.git
+.gitignore
+.claude
+Dockerfile
+docker-compose.yml
+README.md

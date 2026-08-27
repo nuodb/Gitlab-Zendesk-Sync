@@ -1,10 +1,22 @@
+# The GitLab host is a short internal name that resolves only via the corporate
+# DNS search suffix. Containers do not inherit the host's search list, so it is
+# declared here or "nuohub" fails with ENOTFOUND.
+x-dns: &dns
+  dns_search:
+    - dsone.3ds.com
+  # Docker defaults to ndots:0, which queries a dotless name literally and never
+  # appends the search list, so "nuohub" alone would fail.
+  dns_opt:
+    - ndots:1
+
 services:
-  jira-zendesk-prod:
+  gitlab-zendesk-prod:
+    <<: *dns
     build: .
-    image: jira-zendesk-prod:latest
+    image: gitlab-zendesk-prod:latest
     working_dir: /app
     env_file:
-      - .env.production
+      - .env
     entrypoint: ["/app/entrypoint.sh"]
     command: ["bun", "start"]
     restart: unless-stopped
@@ -15,12 +27,13 @@ services:
         max-file: "3"
     volumes:
       - ./logs:/app/logs
-  jira-zendesk-dev:
+  gitlab-zendesk-dev:
+    <<: *dns
     build: .
-    image: jira-zendesk-dev:latest
+    image: gitlab-zendesk-dev:latest
     working_dir: /app
     env_file:
-      - .env.development
+      - .env
     entrypoint: ["/app/entrypoint.sh"]
     command: ["bun", "dev"]
     restart: unless-stopped
@@ -31,18 +44,25 @@ services:
         max-file: "3"
     volumes:
       - ./logs:/app/logs
-  jira-zendesk-test:
+      # bun dev runs with --watch, so edits on the host apply without a rebuild.
+      - ./index.ts:/app/index.ts
+      - ./zendesk.ts:/app/zendesk.ts
+      - ./gitlab.ts:/app/gitlab.ts
+      - ./gitlabRef.ts:/app/gitlabRef.ts
+      - ./changeNote.ts:/app/changeNote.ts
+  gitlab-zendesk-test:
     build: .
-    image: jira-zendesk-test:latest
+    image: gitlab-zendesk-test:latest
     working_dir: /app
     env_file:
-      - .env.test
-    command: ["bun", "test"]
-  jira-zendesk-health:
+      - .env
+    command: ["bun", "test", "tests/unit"]
+  gitlab-zendesk-health:
+    <<: *dns
     build: .
-    image: jira-zendesk-health:latest
+    image: gitlab-zendesk-health:latest
     working_dir: /app
     env_file:
-      - .env.production
+      - .env
     entrypoint: ["/app/entrypoint.sh"]
     command: ["bun", "health-check.ts"]
