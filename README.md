@@ -12,7 +12,6 @@
   - [Development](#development)
   - [Testing](#testing)
   - [Health Check](#health-check)
-  - [Dry Run](#dry-run)
 - [Running with Docker Compose](#running-with-docker-compose)
 
 <!-- /TOC -->
@@ -116,7 +115,6 @@ The token is requested with the scopes `tickets:read tickets:write read write`. 
 - `docker-compose.yml` - Docker Compose configuration
 - `Dockerfile` - Docker build instructions
 - `.dockerignore` - Keeps secrets and `node_modules` out of the image
-- `.env` - Environment variable file
 
 ## Running the Server (Production & Development)
 
@@ -190,16 +188,9 @@ docker compose run --rm gitlab-zendesk-health
 
 The search check also reports how many open tickets currently have a work item linked.
 
-### Dry Run
-
-Before the first run against a live Zendesk, set `DRY_RUN=true` in `.env` and start the server normally. It performs a full cycle and logs every ticket it would update, the field values, and the text of any internal note, without sending anything.
-
-This is the fastest way to see how many tickets are affected and whether any field values are stale or unparseable.
-
 ## Running with Docker Compose
 
 - Ensure you have Docker and Docker Compose installed.
-- Copy `.env.example` to `.env` and fill in the required values.
 - Use `docker compose up --build -d <service>` to start a service in detached mode.
 - Use `docker compose logs -f <service>` to follow the logs of a service.
 
