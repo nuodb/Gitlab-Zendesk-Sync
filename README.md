@@ -37,7 +37,7 @@ docker compose down
 ## Features
 
 - **Automatic Polling:**
-  - Polls Zendesk every 30 seconds for open tickets that have a GitLab work item linked.
+  - Polls Zendesk every 3 minutes for open tickets that have a GitLab work item linked.
   - Fetches every linked work item from GitLab in a single GraphQL request, regardless of how many tickets or projects are involved.
 - **Stateless Comparison:**
   - Holds no cache. Each cycle compares GitLab's values against the values already on the ticket and writes only the tickets that differ.
@@ -53,7 +53,7 @@ docker compose down
 
 1. **Startup:**
    - Validates that all required environment variables are set, and exits if any are missing.
-   - Runs one sync cycle immediately, then every 30 seconds.
+   - Runs one sync cycle immediately, then every 3 minutes.
    - A guard prevents cycles from overlapping if one runs long.
 
 2. **Polling:**

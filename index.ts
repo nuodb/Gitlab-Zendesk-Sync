@@ -135,8 +135,8 @@ async function main() {
 
         await pollAndSync();
 
-        const INTERVAL = 30 * 1000;
-        setInterval(pollAndSync, INTERVAL); // every 30 seconds
+        const INTERVAL = 3 * 60 * 1000;
+        setInterval(pollAndSync, INTERVAL); // every 3 minutes
 
     } catch (err) {
         log(`Startup error: ${err instanceof Error ? err.stack : err}`);
