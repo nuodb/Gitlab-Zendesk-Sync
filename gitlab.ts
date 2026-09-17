@@ -81,8 +81,9 @@ namespace gitlab {
      * Fetch the current state of the given work items.
      *
      * Refs are grouped by namespace and each namespace becomes one alias in a
-     * single GraphQL request, so any number of tickets costs one round trip.
-     * Merge request and epic refs are logged and skipped.
+     * GraphQL request. Namespaces are batched a few at a time to stay under
+     * GitLab's per-query complexity limit, so this may take more than one
+     * round trip. Merge request and epic refs are logged and skipped.
      */
     export async function getWorkItems(refs: GitLabRef[]): Promise<PropsForZendesk[]> {
         // Epics are group level work items and resolve through the same query.
@@ -97,48 +98,56 @@ namespace gitlab {
         const byPath = groupByPath(workItemRefs);
         const paths = Array.from(byPath.keys());
 
-        // A namespace path may be a project or a group, and nothing in the pasted
-        // link says which. Ask for both; the wrong one comes back null.
-        const params = paths
-            .flatMap((_, i) => [`$path${i}: ID!`, `$iids${i}: [String!]`])
-            .join(", ");
-        const aliases = paths
-            .map((_, i) => `
-            p${i}: project(fullPath: $path${i}) {
-                workItems(iids: $iids${i}) { nodes { ${NODE_FIELDS} } }
-            }
-            g${i}: group(fullPath: $path${i}) {
-                workItems(iids: $iids${i}) { nodes { ${NODE_FIELDS} } }
-            }`)
-            .join("");
-
-        const variables: Record<string, unknown> = {};
-        paths.forEach((path, i) => {
-            variables[`path${i}`] = path;
-            variables[`iids${i}`] = byPath.get(path)!.map((r) => String(r.iid));
-        });
-
-        const data = await graphql<Record<string, { workItems: { nodes: WorkItemNode[] } } | null>>(
-            `query(${params}) {${aliases}\n}`,
-            variables,
-        );
-
         // A returned node carries only its iid, so map it back to the reference
         // that asked for it: an epic's canonical ref uses "&", not "#".
         const refByKey = new Map(workItemRefs.map((r) => [`${r.fullPath}:${r.iid}`, r]));
 
+        // Each path costs ~122 GraphQL complexity points because both project and
+        // group aliases are queried (nothing in a pasted link says which one it
+        // is; the wrong one comes back null). GitLab caps queries at 250, so more
+        // than 2 paths in one request gets rejected outright. Batching keeps this
+        // working regardless of how many distinct namespaces tickets reference.
+        const PATHS_PER_REQUEST = 2;
         const items: PropsForZendesk[] = [];
-        paths.forEach((path, i) => {
-            const namespace = data[`p${i}`] ?? data[`g${i}`];
-            if (!namespace) {
-                log(`ERROR: namespace not found or not visible to this token: ${path}`);
-                return;
-            }
-            for (const node of namespace.workItems.nodes) {
-                const ref = refByKey.get(`${path}:${node.iid}`);
-                if (ref) items.push(toProps(ref, node));
-            }
-        });
+        for (let start = 0; start < paths.length; start += PATHS_PER_REQUEST) {
+            const batch = paths.slice(start, start + PATHS_PER_REQUEST);
+
+            const params = batch
+                .flatMap((_, i) => [`$path${i}: ID!`, `$iids${i}: [String!]`])
+                .join(", ");
+            const aliases = batch
+                .map((_, i) => `
+                p${i}: project(fullPath: $path${i}) {
+                    workItems(iids: $iids${i}) { nodes { ${NODE_FIELDS} } }
+                }
+                g${i}: group(fullPath: $path${i}) {
+                    workItems(iids: $iids${i}) { nodes { ${NODE_FIELDS} } }
+                }`)
+                .join("");
+
+            const variables: Record<string, unknown> = {};
+            batch.forEach((path, i) => {
+                variables[`path${i}`] = path;
+                variables[`iids${i}`] = byPath.get(path)!.map((r) => String(r.iid));
+            });
+
+            const data = await graphql<Record<string, { workItems: { nodes: WorkItemNode[] } } | null>>(
+                `query(${params}) {${aliases}\n}`,
+                variables,
+            );
+
+            batch.forEach((path, i) => {
+                const namespace = data[`p${i}`] ?? data[`g${i}`];
+                if (!namespace) {
+                    log(`ERROR: namespace not found or not visible to this token: ${path}`);
+                    return;
+                }
+                for (const node of namespace.workItems.nodes) {
+                    const ref = refByKey.get(`${path}:${node.iid}`);
+                    if (ref) items.push(toProps(ref, node));
+                }
+            });
+        }
 
         const found = new Set(items.map((i) => i.ref));
         const missing = workItemRefs.filter((r) => !found.has(r.ref)).map((r) => r.ref);

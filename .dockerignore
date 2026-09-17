@@ -11,3 +11,7 @@ logs
 Dockerfile
 docker-compose.yml
 README.md
+
+# dotenv environment variable files - hold live credentials, injected at
+# runtime via docker-compose's env_file, never baked into the image
+.env*
